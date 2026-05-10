@@ -1,0 +1,49 @@
+{
+  "_uitleg": "QB VPS Server configuratie â€” ALLEEN voor upload naar Hetzner VPS (5.75.154.99). Lokale config = config.json",
+
+  "qb_root": "/opt/qb-oracle/data",
+
+  "email_enabled": true,
+  "notify_email": "bryanndevries@gmail.com",
+  "smtp_host": "smtp.gmail.com",
+  "smtp_port": 587,
+  "smtp_user": "bryanndevries@gmail.com",
+  "smtp_pass": "jmhhxxfhiubowysj",
+
+  "eboekhouden": {
+    "username": "BryandeVries",
+    "code1": "fd1da4812126ce3cbd27bd4b386db629",
+    "code2": "DF19769D-7F6C-485A-B0C3-3CF5AFA6A3AD"
+  },
+
+  "tarieven": {
+    "Bryan de Vries â€” Directeur": 65,
+    "Maurice Weller â€” Timmerman": 50,
+    "Jordi Boverhoff â€” FinanciÃ«n": 30
+  },
+
+  "_aanneemwerk_uitleg": [
+    "type 'per_unit'  â†’ medewerker vult aantal in, totaal = aantal Ã— prijs_per_eenheid",
+    "type 'vast'      â†’ vaste totaalprijs, medewerker logt alleen werkelijke uren",
+    "actief: false    â†’ job verbergen zonder verwijderen"
+  ],
+  "aanneemwerk_jobs": [
+    {
+      "id": "aw-2026-001-001",
+      "project_id": "2026-001",
+      "omschrijving": "Dakramen plaatsen",
+      "type": "per_unit",
+      "eenheid": "dakraam",
+      "prijs_per_eenheid": 53.50,
+      "actief": true
+    },
+    {
+      "id": "aw-2026-002-001",
+      "project_id": "2026-002",
+      "omschrijving": "Kozijnen vervangen + glaswerk + afwerking",
+      "type": "vast",
+      "bedrag": 1620,
+      "actief": true
+    }
+  ]
+}
