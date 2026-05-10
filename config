@@ -1,0 +1,43 @@
+{
+  "_uitleg": "QB Veld Server configuratie â€” pas paden, e-mail en aanneemwerk aan",
+
+  "qb_root": "C:\\Users\\info\\OneDrive\\Quality Builds Cowork\\Quality Builds",
+
+  "email_enabled": true,
+  "notify_email": "bryanndevries@gmail.com",
+  "smtp_host": "smtp.gmail.com",
+  "smtp_port": 587,
+  "smtp_user": "bryanndevries@gmail.com",
+  "smtp_pass": "jmhhxxfhiubowysj",
+
+  "tarieven": {
+    "Bryan de Vries â€” Directeur": 65,
+    "Maurice Weller â€” Timmerman": 50,
+    "Jordi Boverhoff â€” FinanciÃ«n": 30
+  },
+
+  "_aanneemwerk_uitleg": [
+    "type 'per_unit'  â†’ medewerker vult aantal in, totaal = aantal Ã— prijs_per_eenheid",
+    "type 'vast'      â†’ vaste totaalprijs, medewerker logt alleen werkelijke uren",
+    "actief: false    â†’ job verbergen zonder verwijderen"
+  ],
+  "aanneemwerk_jobs": [
+    {
+      "id": "aw-2026-001-001",
+      "project_id": "2026-001",
+      "omschrijving": "Dakramen plaatsen",
+      "type": "per_unit",
+      "eenheid": "dakraam",
+      "prijs_per_eenheid": 53.50,
+      "actief": true
+    },
+    {
+      "id": "aw-2026-002-001",
+      "project_id": "2026-002",
+      "omschrijving": "Kozijnen vervangen + glaswerk + afwerking",
+      "type": "vast",
+      "bedrag": 1620,
+      "actief": true
+    }
+  ]
+}
