@@ -1,0 +1,1876 @@
+"""
+QB Oracle — Quality Builds BV
+Upload server voor foto's, meerwerk en urenregistratie.
+Draait op http://localhost:5050  |  Maurice: http://[jouw-IP]:5050
+
+Start via: START_ORACLE_LOKAAL.bat
+"""
+
+import os
+import json
+import uuid
+import datetime
+import smtplib
+import shutil
+import mimetypes
+import threading
+import time
+import re
+import xml.etree.ElementTree as ET
+from urllib.request import urlopen, Request as URLRequest
+from urllib.error import URLError
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.image import MIMEImage
+from flask import Flask, request, jsonify, send_file, Response
+from flask_cors import CORS
+from werkzeug.utils import secure_filename
+
+# ── Configuratie laden ─────────────────────────────────────────────────────
+BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
+CONFIG_PATH = os.path.join(BASE_DIR, 'config.json')
+
+with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
+    CFG = json.load(f)
+
+QB_ROOT = CFG['qb_root']   # bijv. C:\Users\info\OneDrive\Quality Builds Cowork\Quality Builds
+
+PROJECT_MAP = {
+    '2026-001': os.path.join('01_PROJECTEN', '06_PROJECT_JP_DAKEN'),
+    '2026-002': os.path.join('01_PROJECTEN', '02_PROJECT_PARKSTRAAT'),
+    '2026-003': os.path.join('01_PROJECTEN', '04_PROJECT_LDN'),
+    '2026-004': os.path.join('01_PROJECTEN', '05_PROJECT_PELS_NETWERK'),
+    '0000':     os.path.join('01_PROJECTEN', '0000_OVERIG'),
+}
+
+PROJECT_NAMES = {
+    '2026-001': 'JP Daken — Jachtwagenstraat Purmerend',
+    '2026-002': 'Parkstraat 8 Zaandijk',
+    '2026-003': 'LDN — Roerdomp 2-98 Purmerend',
+    '2026-004': 'Pels Netwerk (Rik Pels) — Heemstede',
+    '0000':     'Overig / Kleine klussen',
+}
+
+ADRES_MAP = {
+    '2026-001': 'Jachtwagenstraat, Purmerend',
+    '2026-002': 'Parkstraat 8, Zaandijk',
+    '2026-003': 'Roerdomp 2-98, Purmerend',
+    '2026-004': 'Heemstede',
+}
+
+# Machine-leesbare project codes — voor QUALITY BUILDS INZENDING JSON-blok in mails.
+# Consistente naamgeving met QB_TARIEVEN.json (door QB-DOCS beheerd).
+PROJECT_CODES = {
+    '2026-001': 'JP_DAKEN_PURMEREND',
+    '2026-002': 'PARKSTRAAT',
+    '2026-003': 'LDN',
+    '2026-004': 'PELS_NETWERK',
+    '0000':     'OVERIG',
+}
+
+PENDING_PATH = os.path.join(QB_ROOT, '00_COMPANY_DATA', 'PENDING_REVIEWS.json')
+
+# ── e-Boekhouden SOAP ─────────────────────────────────────────────────────
+_EB_URL    = 'https://soap.e-boekhouden.nl/soap.asmx'
+_EB_NS     = 'http://www.e-boekhouden.nl/soap'
+_eb_cache  = {'data': None, 'ts': 0}
+_eb_lock   = threading.Lock()
+_EB_TTL    = 300  # 5 min cache
+_eb_fact_cache  = {'data': None, 'ts': 0}
+_eb_fact_lock   = threading.Lock()
+
+def _eb_call(action, body):
+    envelope = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"'
+        ' xmlns:tns="' + _EB_NS + '">'
+        '<soap:Body>' + body + '</soap:Body>'
+        '</soap:Envelope>'
+    )
+    req = URLRequest(_EB_URL)
+    req.add_header('Content-Type', 'text/xml; charset=utf-8')
+    req.add_header('SOAPAction', '"' + _EB_NS + '/' + action + '"')
+    req.data = envelope.encode('utf-8')
+    with urlopen(req, timeout=15) as r:
+        return ET.fromstring(r.read().decode('utf-8'))
+
+def _eb_text(el, tag):
+    child = el.find('{' + _EB_NS + '}' + tag)
+    return child.text if child is not None and child.text else ''
+
+def _eb_num(el, tag):
+    child = el.find('{' + _EB_NS + '}' + tag)
+    try:
+        return float(child.text) if child is not None and child.text else 0.0
+    except (ValueError, TypeError):
+        return 0.0
+
+def eb_fetch():
+    with _eb_lock:
+        if _eb_cache['data'] and (time.time() - _eb_cache['ts']) < _EB_TTL:
+            return _eb_cache['data']
+
+    cfg_eb  = CFG.get('eboekhouden', {})
+    user    = cfg_eb.get('username', '')
+    code1   = cfg_eb.get('code1', '')
+    code2   = cfg_eb.get('code2', '')
+
+    # 1. Open session
+    root = _eb_call('OpenSession',
+        '<tns:OpenSession>'
+        '<tns:Username>' + user + '</tns:Username>'
+        '<tns:SecurityCode1>' + code1 + '</tns:SecurityCode1>'
+        '<tns:SecurityCode2>' + code2 + '</tns:SecurityCode2>'
+        '<tns:Source>QB-Oracle</tns:Source>'
+        '</tns:OpenSession>')
+    sid_el = root.find('.//{' + _EB_NS + '}SessionID')
+    if sid_el is None or not sid_el.text:
+        err = root.find('.//{' + _EB_NS + '}LastErrorDescription')
+        raise RuntimeError('OpenSession mislukt: ' + (err.text if err is not None else 'onbekend'))
+    sid = sid_el.text
+
+    try:
+        # 2. GetOpenPosten debiteuren
+        root2 = _eb_call('GetOpenPosten',
+            '<tns:GetOpenPosten>'
+            '<tns:SessionID>' + sid + '</tns:SessionID>'
+            '<tns:SecurityCode2>' + code2 + '</tns:SecurityCode2>'
+            '<tns:OpSoort>Debiteuren</tns:OpSoort>'
+            '</tns:GetOpenPosten>')
+
+        posten = []
+        open_map = {}
+        for p in root2.findall('.//{' + _EB_NS + '}cOpenPost'):
+            datum = _eb_text(p, 'MutDatum')[:10]
+            fnr   = _eb_text(p, 'MutFactuur')
+            op    = _eb_num(p, 'Openstaand')
+            posten.append({
+                'datum':    datum,
+                'factuur':  fnr,
+                'rel_code': _eb_text(p, 'RelCode'),
+                'relatie':  _eb_text(p, 'RelBedrijf'),
+                'bedrag':   _eb_num(p, 'Bedrag'),
+                'voldaan':  _eb_num(p, 'Voldaan'),
+                'open':     op,
+            })
+            if fnr:
+                open_map[fnr] = op
+        posten.sort(key=lambda x: x['datum'], reverse=True)
+
+        # 3. GetFacturen — huidig jaar
+        _jaar = datetime.datetime.now().year
+        _dvan = str(_jaar) + '-01-01'
+        _dtm  = datetime.datetime.now().strftime('%Y-%m-%d')
+        root_f = _eb_call('GetFacturen',
+            '<tns:GetFacturen>'
+            '<tns:SessionID>' + sid + '</tns:SessionID>'
+            '<tns:SecurityCode2>' + code2 + '</tns:SecurityCode2>'
+            '<tns:cFilter>'
+            '<tns:Relatiecode></tns:Relatiecode>'
+            '<tns:DatumVan>' + _dvan + '</tns:DatumVan>'
+            '<tns:DatumTm>' + _dtm + '</tns:DatumTm>'
+            '</tns:cFilter>'
+            '</tns:GetFacturen>')
+        facturen = []
+        for f in root_f.findall('.//{' + _EB_NS + '}cFactuurList'):
+            nr   = _eb_text(f, 'Factuurnummer')
+            excl = _eb_num(f, 'TotaalExclBTW')
+            op   = open_map.get(nr, 0.0)
+            facturen.append({
+                'nr':     nr,
+                'rel':    _eb_text(f, 'Relatiecode'),
+                'datum':  _eb_text(f, 'Datum')[:10],
+                'excl':   round(excl, 2),
+                'status': 'open' if nr in open_map else 'betaald',
+                'open':   round(op, 2),
+            })
+        facturen.sort(key=lambda x: x['datum'], reverse=True)
+
+        # 4. Per relatie samenvatting
+        per_rel = {}
+        for f in facturen:
+            r = f['rel']
+            if r not in per_rel:
+                per_rel[r] = {'rel': r, 'facturen': 0, 'excl': 0.0, 'open': 0.0}
+            per_rel[r]['facturen'] += 1
+            per_rel[r]['excl']      = round(per_rel[r]['excl'] + f['excl'], 2)
+            per_rel[r]['open']      = round(per_rel[r]['open'] + f['open'], 2)
+        per_relatie = sorted(per_rel.values(), key=lambda x: -x['excl'])
+
+        totaal_excl    = round(sum(f['excl'] for f in facturen), 2)
+        totaal_betaald = round(sum(f['excl'] - f['open'] for f in facturen), 2)
+
+        result = {
+            'posten':            posten,
+            'totaal_open':       round(sum(p['open'] for p in posten), 2),
+            'totaal_bedrag':     round(sum(p['bedrag'] for p in posten), 2),
+            'aantal':            len(posten),
+            'facturen':          facturen,
+            'facturen_count':    len(facturen),
+            'per_relatie':       per_relatie,
+            'totaal_omzet_excl': totaal_excl,
+            'totaal_betaald':    totaal_betaald,
+            'bijgewerkt':        datetime.datetime.now().strftime('%d-%m-%Y %H:%M'),
+        }
+    finally:
+        try:
+            _eb_call('CloseSession',
+                '<tns:CloseSession><tns:SessionID>' + sid + '</tns:SessionID></tns:CloseSession>')
+        except Exception:
+            pass
+
+    with _eb_lock:
+        _eb_cache['data'] = result
+        _eb_cache['ts']   = time.time()
+    return result
+
+
+def eb_fetch_facturen(jaar=None):
+    """GetFacturen + cross-ref GetOpenPosten voor betaalstatus. Cache 5 min."""
+    with _eb_fact_lock:
+        if _eb_fact_cache['data'] and (time.time() - _eb_fact_cache['ts']) < _EB_TTL:
+            return _eb_fact_cache['data']
+
+    cfg_eb = CFG.get('eboekhouden', {})
+    user   = cfg_eb.get('username', '')
+    code1  = cfg_eb.get('code1', '')
+    code2  = cfg_eb.get('code2', '')
+
+    if jaar is None:
+        jaar = datetime.datetime.now().year
+    datum_van = str(jaar) + '-01-01'
+    datum_tm  = datetime.datetime.now().strftime('%Y-%m-%d')
+
+    # 1. Open session
+    root = _eb_call('OpenSession',
+        '<tns:OpenSession>'
+        '<tns:Username>' + user + '</tns:Username>'
+        '<tns:SecurityCode1>' + code1 + '</tns:SecurityCode1>'
+        '<tns:SecurityCode2>' + code2 + '</tns:SecurityCode2>'
+        '<tns:Source>QB-Oracle</tns:Source>'
+        '</tns:OpenSession>')
+    sid_el = root.find('.//{' + _EB_NS + '}SessionID')
+    if sid_el is None or not sid_el.text:
+        err = root.find('.//{' + _EB_NS + '}LastErrorDescription')
+        raise RuntimeError('OpenSession mislukt: ' + (err.text if err is not None else 'onbekend'))
+    sid = sid_el.text
+
+    facturen = []
+    open_map = {}  # factuur_nr -> openstaand bedrag
+
+    try:
+        # 2a. GetFacturen — alle facturen dit jaar
+        root_f = _eb_call('GetFacturen',
+            '<tns:GetFacturen>'
+            '<tns:SessionID>' + sid + '</tns:SessionID>'
+            '<tns:SecurityCode2>' + code2 + '</tns:SecurityCode2>'
+            '<tns:cFilter>'
+            '<tns:Relatiecode></tns:Relatiecode>'
+            '<tns:DatumVan>' + datum_van + '</tns:DatumVan>'
+            '<tns:DatumTm>' + datum_tm + '</tns:DatumTm>'
+            '</tns:cFilter>'
+            '</tns:GetFacturen>')
+
+        for f in root_f.findall('.//{' + _EB_NS + '}cFactuurList'):
+            nr          = _eb_text(f, 'Factuurnummer')
+            rel_code    = _eb_text(f, 'Relatiecode')
+            datum       = _eb_text(f, 'Datum')[:10]
+            excl        = _eb_num(f, 'TotaalExclBTW')
+            btw_bedrag  = _eb_num(f, 'TotaalBTW')
+            incl        = _eb_num(f, 'TotaalInclBTW')
+            facturen.append({
+                'factuur_nr':   nr,
+                'rel_code':     rel_code,
+                'datum':        datum,
+                'excl_btw':     round(excl, 2),
+                'btw':          round(btw_bedrag, 2),
+                'incl_btw':     round(incl, 2),
+                'status':       'onbekend',
+                'open':         round(incl, 2),
+            })
+
+        # 2b. GetOpenPosten — debiteuren voor betaalstatus
+        root_op = _eb_call('GetOpenPosten',
+            '<tns:GetOpenPosten>'
+            '<tns:SessionID>' + sid + '</tns:SessionID>'
+            '<tns:SecurityCode2>' + code2 + '</tns:SecurityCode2>'
+            '<tns:OpSoort>Debiteuren</tns:OpSoort>'
+            '</tns:GetOpenPosten>')
+
+        for p in root_op.findall('.//{' + _EB_NS + '}cOpenPost'):
+            fnr = _eb_text(p, 'MutFactuur')
+            op  = _eb_num(p, 'Openstaand')
+            if fnr:
+                open_map[fnr] = op
+
+    finally:
+        try:
+            _eb_call('CloseSession',
+                '<tns:CloseSession><tns:SessionID>' + sid + '</tns:SessionID></tns:CloseSession>')
+        except Exception:
+            pass
+
+    # 3. Cross-reference betaalstatus
+    for f in facturen:
+        nr = f['factuur_nr']
+        if nr in open_map:
+            op = open_map[nr]
+            f['open'] = round(op, 2)
+            f['status'] = 'open' if op > 0.01 else 'betaald'
+        else:
+            f['open'] = 0.0
+            f['status'] = 'betaald'
+
+    # 4. Groepeer per relatiecode + totalen
+    rel_totals = {}
+    for f in facturen:
+        rc = f['rel_code'] or 'onbekend'
+        if rc not in rel_totals:
+            rel_totals[rc] = {'rel_code': rc, 'facturen': [], 'totaal_excl': 0.0, 'totaal_incl': 0.0, 'totaal_open': 0.0, 'aantal': 0}
+        rel_totals[rc]['facturen'].append(f)
+        rel_totals[rc]['totaal_excl']  = round(rel_totals[rc]['totaal_excl']  + f['excl_btw'], 2)
+        rel_totals[rc]['totaal_incl']  = round(rel_totals[rc]['totaal_incl']  + f['incl_btw'], 2)
+        rel_totals[rc]['totaal_open']  = round(rel_totals[rc]['totaal_open']  + f['open'],     2)
+        rel_totals[rc]['aantal']       += 1
+
+    facturen.sort(key=lambda x: x['datum'], reverse=True)
+
+    result = {
+        'jaar':             jaar,
+        'facturen':         facturen,
+        'per_relatie':      list(rel_totals.values()),
+        'totaal_excl':      round(sum(f['excl_btw'] for f in facturen), 2),
+        'totaal_incl':      round(sum(f['incl_btw'] for f in facturen), 2),
+        'totaal_open':      round(sum(f['open'] for f in facturen), 2),
+        'aantal':           len(facturen),
+        'aantal_betaald':   sum(1 for f in facturen if f['status'] == 'betaald'),
+        'bijgewerkt':       datetime.datetime.now().strftime('%d-%m-%Y %H:%M'),
+    }
+
+    with _eb_fact_lock:
+        _eb_fact_cache['data'] = result
+        _eb_fact_cache['ts']   = time.time()
+    return result
+
+
+# ── Normtijden cache (QB_NORMTIJDEN.json) ────────────────────────────────────
+_NT_CACHE = {'data': None, 'ts': 0}
+_NT_LOCK  = threading.Lock()
+_NT_TTL   = 300  # 5 minuten
+
+def _load_normtijden():
+    """Laad normtijden uit QB_NORMTIJDEN.json (cached 5 min)."""
+    with _NT_LOCK:
+        if _NT_CACHE['data'] and (time.time() - _NT_CACHE['ts']) < _NT_TTL:
+            return _NT_CACHE['data']
+    path = os.path.join(QB_ROOT, '00_COMPANY_DATA', 'QB_NORMTIJDEN.json')
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            raw = json.load(f)
+        data = raw.get('purmerend_jp_daken', {})
+    except Exception:
+        data = {}
+    with _NT_LOCK:
+        _NT_CACHE['data'] = data
+        _NT_CACHE['ts']   = time.time()
+    return data
+
+
+def verwacht_uren_uit_wr(week_data):
+    """Bereken verwachte uren op basis van normtijden × WR-aantallen voor één week.
+
+    week_data: dict met keys klein / middel / groot / kit / sloop / boei
+    Retourneert float uren (netto productief).
+    Meerwerk heeft geen normtijden — niet meenemen.
+    """
+    nt = _load_normtijden()
+    if not nt:
+        return None  # normtijden niet beschikbaar
+
+    klein  = week_data.get('klein',  0)
+    middel = week_data.get('middel', 0)
+    groot  = week_data.get('groot',  0)
+    kit    = week_data.get('kit',    0)
+    sloop  = week_data.get('sloop',  0.0)   # al in uren op WR
+    boei   = week_data.get('boei',   0.0)   # in meters
+
+    minuten = (
+        klein  * nt.get('dakraam_klein_min',   35) +
+        middel * nt.get('dakraam_middel_min',  38) +
+        groot  * nt.get('dakraam_groot_min',   40) +
+        kit    * nt.get('kit_min_per_stuk',     5) +
+        boei   * nt.get('boeideel_min_per_m', 18.6)
+    )
+    # Sloop staat al in uren op de WR — standaard 0,25u/dakraam is erin verwerkt
+    uren = minuten / 60.0 + float(sloop)
+    return round(uren, 2)
+
+
+# ── WR Dakramen parser ────────────────────────────────────────────────────────
+_WR_CACHE = {'data': None, 'ts': 0}
+_WR_LOCK  = threading.Lock()
+_WR_TTL   = 3600  # 1 uur — WR bestanden veranderen niet vaak
+
+# Contract totalen JP Daken (uit offerte PURMEREND_GEACCEPTEERDE_OFFERTE_2025.pdf)
+_JP_CONTRACT_DAKRAMEN = 628
+_JP_CONTRACT_BOEI     = 386.0
+
+def _parse_wr_bedrag(text):
+    """Extraheer TOTAAL excl. BTW bedrag uit WR PDF text (beide formaten)."""
+    matches = re.findall(r'TOTAAL[^€\n]{0,30}€\s*([\d.]+,\d{2})', text, re.IGNORECASE)
+    if not matches:
+        matches = re.findall(r'€\s*([\d.]+,\d{2})', text)
+    if matches:
+        amounts = []
+        for m in matches:
+            try:
+                amounts.append(float(m.replace('.', '').replace(',', '.')))
+            except Exception:
+                pass
+        if amounts:
+            return round(max(amounts), 2)
+    return 0.0
+
+
+def _wr_week_label(fn):
+    """Geef leesbaar weeklabel uit bestandsnaam.
+    Nieuw: WK_03_2026_PURMEREND_WR.pdf  → 'WK 03'
+    Oud:   WRF20250001_WK02_10012025_PURMEREND.pdf → 'WK 02 (2025)'
+    """
+    m = re.match(r'WK_(\d+)_(\d{4})_', fn, re.IGNORECASE)
+    if m:
+        return f"WK {int(m.group(1)):02d}"
+    m = re.search(r'_WK(\d+)_', fn, re.IGNORECASE)
+    if m:
+        return f"WK {int(m.group(1)):02d} (2025)"
+    return fn
+
+
+def _parse_wr_text(text):
+    """Extraheer klein/middel/groot/kit/sloop/boei uit WR PDF text.
+    Formaat A (oud): 'Klein dakraam (10 x €246,54)' — getal vóór ×
+    Formaat B (nieuw): '__ × 10 € 246,54' — getal ná ×
+    """
+    # Formaat B: integers direct na ×\s in REKENOVERZICHT sectie
+    vals_b = re.findall(r'[×x]\s+(\d+)\s', text)
+    if vals_b and len(vals_b) >= 4:
+        klein  = int(vals_b[0]) if len(vals_b) > 0 else 0
+        middel = int(vals_b[1]) if len(vals_b) > 1 else 0
+        groot  = int(vals_b[2]) if len(vals_b) > 2 else 0
+        kit    = int(vals_b[3]) if len(vals_b) > 3 else 0
+        sloop_m = re.search(r'([0-9]+[,\.][0-9]+)\s*uur\s*[×x]', text)
+        # Boeideel: twee formaten —
+        #   oud: "14,5 m × €188,65"  → getal VOOR ×
+        #   nieuw: "× 14,5 m €188,65" → getal NA ×
+        boei_m  = re.search(r'[×x]\s+([0-9]+[,\.][0-9]+)\s*m\b', text)
+        if not boei_m:
+            boei_m = re.search(r'([0-9]+[,\.][0-9]+)\s*m\s*[×x]', text)
+        sloop = float(sloop_m.group(1).replace(',', '.')) if sloop_m else 0.0
+        boei  = float(boei_m.group(1).replace(',', '.'))  if boei_m  else 0.0
+        return klein, middel, groot, kit, sloop, boei
+    # Formaat A: getal vóór × tussen haakjes
+    def old_n(label):
+        m = re.search(label + r'[^(]*\((\d+(?:[,\.]\d+)?)\s*[×x]', text, re.IGNORECASE)
+        return float(m.group(1).replace(',', '.')) if m else 0.0
+    klein  = int(old_n(r'[Kk]lein'))
+    middel = int(old_n(r'[Mm]iddel'))
+    groot  = int(old_n(r'[Gg]root'))
+    sloop_m = re.search(r'[Ss]loop[^(]*\(([\d,\.]+)\s*uur?\s*[×x]', text, re.IGNORECASE)
+    boei_m  = re.search(r'[Bb]oei[^(]*\(([\d,\.]+)\s*m\s*[×x]', text, re.IGNORECASE)
+    sloop = float(sloop_m.group(1).replace(',', '.')) if sloop_m else 0.0
+    boei  = float(boei_m.group(1).replace(',', '.'))  if boei_m  else 0.0
+    return klein, middel, groot, 0, sloop, boei
+
+
+def wr_dakramen_totals():
+    """Lees alle WR PDFs van Purmerend en sommeer dakraam-aantallen. Cache 1 uur."""
+    with _WR_LOCK:
+        if _WR_CACHE['data'] and (time.time() - _WR_CACHE['ts']) < _WR_TTL:
+            return _WR_CACHE['data']
+
+    try:
+        import pdfplumber
+    except ImportError:
+        return {'beschikbaar': False, 'error': 'pdfplumber niet geinstalleerd op server'}
+
+    # Probeer nieuwe mapnaam eerst (na reorg 05-2026), dan fallback naar oud pad
+    wr_dir = None
+    for subdir in ['05_BONNEN', '05_UREN_EN_PLANNING']:
+        candidate = os.path.join(QB_ROOT, '01_PROJECTEN', '01_PROJECT_PURMEREND',
+                                 subdir, '01_2026_WR_PURMEREND')
+        if os.path.isdir(candidate):
+            wr_dir = candidate
+            break
+    if not wr_dir:
+        return {'beschikbaar': False, 'error': 'WR map niet gevonden (05_BONNEN en 05_UREN_EN_PLANNING geprobeerd)'}
+
+    # 2025 archief — historische WRs in 05_BONNEN
+    archief_dir = os.path.join(QB_ROOT, '01_PROJECTEN', '01_PROJECT_PURMEREND',
+                               '05_BONNEN', '01_2025_WR_PURMEREND_HISTORISCH')
+
+    totals   = {'klein': 0, 'middel': 0, 'groot': 0, 'kit': 0, 'sloop': 0.0, 'boei': 0.0}
+    per_week = []
+
+    # Verzamel PDFs: 2025 archief eerst (sorteer chronologisch), dan 2026
+    all_files = []
+    if os.path.isdir(archief_dir):
+        for fn in os.listdir(archief_dir):
+            if fn.endswith('.pdf') and 'WR' in fn:
+                all_files.append((fn, archief_dir))
+    for fn in os.listdir(wr_dir):
+        if fn.endswith('.pdf'):
+            all_files.append((fn, wr_dir))
+    all_files = sorted(all_files, key=lambda x: x[0])
+    files = all_files  # lijst van (bestandsnaam, map)
+
+    for fn, fdir in files:
+        text = ''
+        try:
+            with pdfplumber.open(os.path.join(fdir, fn)) as pdf:
+                for p in pdf.pages:
+                    text += (p.extract_text() or '')
+        except Exception:
+            continue
+        k, m, g, kit, sl, bo = _parse_wr_text(text)
+        bedrag = _parse_wr_bedrag(text)
+        jaar = 2025 if fdir == archief_dir else 2026
+        label = _wr_week_label(fn)
+        per_week.append({
+            'bestand': fn, 'week_label': label, 'jaar': jaar,
+            'klein': k, 'middel': m, 'groot': g,
+            'kit': kit, 'sloop': sl, 'boei': bo,
+            'dakramen': k + m + g, 'bedrag': bedrag,
+        })
+        totals['klein']  += k
+        totals['middel'] += m
+        totals['groot']  += g
+        totals['kit']    += kit
+        totals['sloop']  += sl
+        totals['boei']   += bo
+
+    dk_totaal = totals['klein'] + totals['middel'] + totals['groot']
+    result = {
+        'beschikbaar':       True,
+        'per_week':          per_week,
+        'totaal_klein':      totals['klein'],
+        'totaal_middel':     totals['middel'],
+        'totaal_groot':      totals['groot'],
+        'totaal_kit':        totals['kit'],
+        'totaal_sloop':      round(totals['sloop'], 1),
+        'totaal_boei':       round(totals['boei'], 1),
+        'dakramen_totaal':   dk_totaal,
+        'contract_dakramen': _JP_CONTRACT_DAKRAMEN,
+        'contract_boei':     _JP_CONTRACT_BOEI,
+        'pct_dakramen':      round(dk_totaal / _JP_CONTRACT_DAKRAMEN * 100, 1),
+        'pct_boei':          round(totals['boei'] / _JP_CONTRACT_BOEI * 100, 1),
+        'bijgewerkt':        datetime.datetime.now().strftime('%d-%m-%Y %H:%M'),
+    }
+    with _WR_LOCK:
+        _WR_CACHE['data'] = result
+        _WR_CACHE['ts']   = time.time()
+    return result
+
+
+# ── e-Boekhouden mutaties voor JP Daken (factuurregels) ───────────────────────
+_EB_MUT_CACHE = {'data': None, 'ts': 0}
+_EB_MUT_LOCK  = threading.Lock()
+
+def eb_jp_mutaties():
+    """GetMutaties voor JP Daken — alle boekingsregels dit jaar. Cache 10 min."""
+    with _EB_MUT_LOCK:
+        if _EB_MUT_CACHE['data'] and (time.time() - _EB_MUT_CACHE['ts']) < 600:
+            return _EB_MUT_CACHE['data']
+
+    cfg_eb = CFG.get('eboekhouden', {})
+    user   = cfg_eb.get('username', '')
+    code1  = cfg_eb.get('code1', '')
+    code2  = cfg_eb.get('code2', '')
+
+    root = _eb_call('OpenSession',
+        '<tns:OpenSession>'
+        '<tns:Username>' + user + '</tns:Username>'
+        '<tns:SecurityCode1>' + code1 + '</tns:SecurityCode1>'
+        '<tns:SecurityCode2>' + code2 + '</tns:SecurityCode2>'
+        '<tns:Source>QB-Oracle</tns:Source>'
+        '</tns:OpenSession>')
+    sid_el = root.find('.//{' + _EB_NS + '}SessionID')
+    if sid_el is None or not sid_el.text:
+        raise RuntimeError('OpenSession mislukt')
+    sid = sid_el.text
+
+    jaar  = datetime.datetime.now().year
+    dvan  = str(jaar) + '-01-01'
+    dtm   = datetime.datetime.now().strftime('%Y-%m-%d')
+
+    mutaties = []
+    try:
+        root_m = _eb_call('GetMutaties',
+            '<tns:GetMutaties>'
+            '<tns:SessionID>' + sid + '</tns:SessionID>'
+            '<tns:SecurityCode2>' + code2 + '</tns:SecurityCode2>'
+            '<tns:cFilter>'
+            '<tns:MutDatumVan>' + dvan + '</tns:MutDatumVan>'
+            '<tns:MutDatumTm>' + dtm + '</tns:MutDatumTm>'
+            '<tns:Relatiecode></tns:Relatiecode>'
+            '</tns:cFilter>'
+            '</tns:GetMutaties>')
+
+        for mut in root_m.findall('.//{' + _EB_NS + '}cMutatieList'):
+            rel     = _eb_text(mut, 'Relatiecode')
+            bedrijf = _eb_text(mut, 'RelBedrijf')
+            # Filter: alleen JP Daken (relatie bevat jp/daken/venrooy/rochdale)
+            zoek = (rel + ' ' + bedrijf).lower()
+            if not any(kw in zoek for kw in ['jp', 'daken', 'venrooy', 'rochdale']):
+                continue
+            regels = []
+            for regel in mut.findall('.//{' + _EB_NS + '}cMutatieListRegel'):
+                regels.append({
+                    'grootboek':    _eb_text(regel, 'BTegenrekeningCode'),
+                    'omschrijving': _eb_text(regel, 'BTegenrekeningOmschrijving'),
+                    'btw_code':     _eb_text(regel, 'BtwCode'),
+                    'btw_omschr':   _eb_text(regel, 'BtwOmschrijving'),
+                    'bedrag':       _eb_num(regel, 'BBedrag'),
+                })
+            mutaties.append({
+                'datum':        _eb_text(mut, 'MutDatum')[:10],
+                'factuur_nr':   _eb_text(mut, 'MutFactuur'),
+                'omschrijving': _eb_text(mut, 'MutOmschrijving'),
+                'rel_code':     rel,
+                'bedrijf':      bedrijf,
+                'bedrag':       _eb_num(mut, 'MutBedrag'),
+                'regels':       regels,
+            })
+    finally:
+        try:
+            _eb_call('CloseSession',
+                '<tns:CloseSession><tns:SessionID>' + sid + '</tns:SessionID></tns:CloseSession>')
+        except Exception:
+            pass
+
+    mutaties.sort(key=lambda x: x['datum'], reverse=True)
+    result = {
+        'mutaties':   mutaties,
+        'aantal':     len(mutaties),
+        'bijgewerkt': datetime.datetime.now().strftime('%d-%m-%Y %H:%M'),
+    }
+    with _EB_MUT_LOCK:
+        _EB_MUT_CACHE['data'] = result
+        _EB_MUT_CACHE['ts']   = time.time()
+    return result
+
+
+# ── Flask app ──────────────────────────────────────────────────────────────
+app = Flask(__name__)
+CORS(app)
+app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024  # 500 MB max upload
+
+# ── Helpers ────────────────────────────────────────────────────────────────
+
+def load_pending():
+    if os.path.exists(PENDING_PATH):
+        with open(PENDING_PATH, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    return []
+
+def save_pending(data):
+    os.makedirs(os.path.dirname(PENDING_PATH), exist_ok=True)
+    with open(PENDING_PATH, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+def get_foto_dir(project_id):
+    proj_folder = PROJECT_MAP.get(project_id, PROJECT_MAP['0000'])
+    foto_dir = os.path.join(QB_ROOT, proj_folder, '07_FOTOS_EN_MEDIA')
+    os.makedirs(foto_dir, exist_ok=True)
+    return foto_dir
+
+
+def stuur_email_uren(submission):
+    if not CFG.get('email_enabled'):
+        return
+    try:
+        smtp_host  = CFG['smtp_host']
+        smtp_port  = int(CFG['smtp_port'])
+        smtp_user  = CFG['smtp_user']
+        smtp_pass  = CFG['smtp_pass']
+        to_email   = CFG['notify_email']
+
+        medewerker   = submission.get('medewerker', '—')
+        project_id   = submission.get('project_id', '0000')
+        project      = PROJECT_NAMES.get(project_id, project_id)
+        datum        = submission.get('datum', '—')
+        omschrijving = submission.get('omschrijving', '—')
+        werktype     = submission.get('werktype', 'uurwerk')
+        totaal_uren  = submission.get('totaal_uren', 0)
+        tarief       = submission.get('tarief', 50)
+        bedrag       = submission.get('bedrag_berekend', 0)
+        sub_id       = submission.get('id', '—')
+        begintijd    = submission.get('begintijd', '—')
+        eindtijd     = submission.get('eindtijd', '—')
+        ref          = sub_id[:8].upper()
+        adres        = ADRES_MAP.get(project_id, '—')
+
+        if werktype == 'aanneemwerk':
+            aw_omschr  = submission.get('aanneemwerk_omschrijving', '—')
+            aw_bedrag  = submission.get('aanneemwerk_bedrag', '—')
+            werktype_html = f"""
+            <tr><td colspan="2" style="padding:12px 16px;background:#1a1a1a;font-weight:900;color:#E07820;font-size:10px;letter-spacing:2.5px;text-transform:uppercase">AANNEEMWERK</td></tr>
+            <tr><td style="padding:8px 16px;color:#666;font-size:11px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase">Job</td><td style="padding:8px 16px;color:#f0f0f0;font-size:13px">{aw_omschr}</td></tr>
+            <tr style="background:#1a1a1a"><td style="padding:8px 16px;color:#666;font-size:11px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase">Vaste prijs</td><td style="padding:8px 16px;color:#E07820;font-size:15px;font-weight:800">&euro; {aw_bedrag}</td></tr>
+            <tr><td style="padding:8px 16px;color:#666;font-size:11px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase">Werkelijke uren</td><td style="padding:8px 16px;color:#f0f0f0;font-size:13px">{totaal_uren} uur</td></tr>
+            """
+            kopie_type = f'AANNEEMWERK   : {aw_omschr}\nVASTE PRIJS   : € {aw_bedrag}\nWERKELIJKE U  : {totaal_uren} uur'
+        else:
+            werktype_html = f"""
+            <tr><td colspan="2" style="padding:12px 16px;background:#1a1a1a;font-weight:900;color:#E07820;font-size:10px;letter-spacing:2.5px;text-transform:uppercase">UURWERK</td></tr>
+            <tr><td style="padding:8px 16px;color:#666;font-size:11px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase">Tarief</td><td style="padding:8px 16px;color:#f0f0f0;font-size:13px">&euro;{tarief}/u</td></tr>
+            <tr style="background:#1a1a1a"><td style="padding:8px 16px;color:#666;font-size:11px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase">Berekend</td><td style="padding:8px 16px;color:#E07820;font-size:15px;font-weight:800">&euro; {bedrag:.2f}</td></tr>
+            """
+            kopie_type = f'TARIEF        : €{tarief}/u\nUREN          : {totaal_uren} uur\nBEDRAG        : € {bedrag:.2f}'
+
+        kopie_blok = (
+            f'DATUM         : {datum}\n'
+            f'PROJECT       : {project}\n'
+            f'ADRES         : {adres}\n'
+            f'MEDEWERKER    : {medewerker}\n'
+            f'WERKTIJD      : {begintijd} – {eindtijd}\n'
+            f'OMSCHRIJVING  : {omschrijving}\n'
+            f'{kopie_type}\n'
+            f'REF           : {ref}'
+        )
+
+        html = f"""
+        <html><body style="margin:0;padding:0;background:#0f0f0f;font-family:'Segoe UI',system-ui,sans-serif">
+        <div style="max-width:620px;margin:0 auto;padding:24px 16px">
+
+          <!-- Logo header -->
+          <div style="background:#1a1a1a;padding:18px 24px 14px;border-radius:12px 12px 0 0;text-align:center;border-bottom:1px solid #2a2a2a">
+            <img src="https://app.qualitybuilds.nl/logo.png" alt="Quality Builds"
+                 style="height:44px;width:auto;max-width:200px;display:inline-block">
+          </div>
+
+          <!-- Type header -->
+          <div style="background:#E07820;padding:14px 24px">
+            <div style="font-size:10px;font-weight:900;color:#fff;letter-spacing:2.5px;text-transform:uppercase">UREN REGISTRATIE</div>
+            <div style="font-size:12px;color:rgba(255,255,255,0.8);margin-top:4px;letter-spacing:0.05em">
+              {datum} &nbsp;&middot;&nbsp; {medewerker.split('—')[0].strip()} &nbsp;&middot;&nbsp; REF: {ref}
+            </div>
+          </div>
+
+          <!-- Data tabel -->
+          <table style="width:100%;border-collapse:collapse;background:#141414">
+            <tr><td style="padding:10px 16px;color:#666;font-size:11px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;width:130px">Medewerker</td>
+                <td style="padding:10px 16px;color:#f0f0f0;font-size:14px;font-weight:600">{medewerker}</td></tr>
+            <tr style="background:#1a1a1a">
+                <td style="padding:10px 16px;color:#666;font-size:11px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase">Project</td>
+                <td style="padding:10px 16px;color:#f0f0f0;font-size:13px">{project}</td></tr>
+            <tr><td style="padding:10px 16px;color:#666;font-size:11px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase">Adres</td>
+                <td style="padding:10px 16px;color:#f0f0f0;font-size:13px">{adres}</td></tr>
+            <tr style="background:#1a1a1a">
+                <td style="padding:10px 16px;color:#666;font-size:11px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase">Datum</td>
+                <td style="padding:10px 16px;color:#f0f0f0;font-size:13px">{datum}</td></tr>
+            <tr><td style="padding:10px 16px;color:#666;font-size:11px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase">Werktijd</td>
+                <td style="padding:10px 16px;color:#f0f0f0;font-size:13px">{begintijd} &ndash; {eindtijd} &nbsp;&middot;&nbsp; {totaal_uren} uur</td></tr>
+            <tr style="background:#1a1a1a">
+                <td style="padding:10px 16px;color:#666;font-size:11px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;vertical-align:top">Omschrijving</td>
+                <td style="padding:10px 16px;color:#f0f0f0;font-size:14px;line-height:1.5">{omschrijving}</td></tr>
+            {werktype_html}
+          </table>
+
+          <!-- Kopie-klaar blok -->
+          <div style="background:#111;border:1px solid #2a2a2a;border-top:2px solid #333;border-radius:0 0 8px 8px;padding:16px;margin-top:0">
+            <div style="font-size:9px;font-weight:900;color:#555;letter-spacing:2.5px;text-transform:uppercase;margin-bottom:12px">KOPIE-KLAAR VOOR URENBRIEF</div>
+            <pre style="margin:0;font-family:'Courier New',Consolas,monospace;font-size:12px;color:#999;
+                        white-space:pre-wrap;line-height:1.9;border-left:2px solid #2a2a2a;padding-left:12px">{kopie_blok}</pre>
+          </div>
+
+          <div style="margin-top:20px;text-align:center;font-size:10px;color:#333;letter-spacing:0.1em;text-transform:uppercase">
+            Quality Builds BV &nbsp;&middot;&nbsp; {ref}
+          </div>
+        </div></body></html>
+        """
+
+        msg = MIMEMultipart('alternative')
+        msg['Subject'] = f'Uren: {medewerker.split("—")[0].strip()} — {project} — {datum} · REF: {ref}'
+        msg['From']    = smtp_user
+        msg['To']      = to_email
+        msg.attach(MIMEText(html, 'html'))
+
+        with smtplib.SMTP(smtp_host, smtp_port, timeout=15) as server:
+            server.starttls()
+            server.login(smtp_user, smtp_pass)
+            server.sendmail(smtp_user, to_email, msg.as_string())
+
+        print(f'[QB] ✅ Uren e-mail verstuurd naar {to_email}')
+    except Exception as e:
+        print(f'[QB] ⚠️  Uren e-mail fout: {e}')
+
+
+def stuur_email(submission):
+    if not CFG.get('email_enabled'):
+        return
+    try:
+        smtp_host  = CFG['smtp_host']
+        smtp_port  = int(CFG['smtp_port'])
+        smtp_user  = CFG['smtp_user']
+        smtp_pass  = CFG['smtp_pass']
+        to_email   = CFG['notify_email']
+
+        medewerker   = submission.get('medewerker', '—')
+        project_id   = submission.get('project_id', '0000')
+        project      = PROJECT_NAMES.get(project_id, project_id)
+        datum        = submission.get('datum', '—')
+        omschrijving = submission.get('omschrijving', '—')
+        fotos        = submission.get('fotos_opgeslagen', [])
+        meerwerk     = submission.get('meerwerk', {})
+        sub_id       = submission.get('id', '—')
+        ref          = sub_id[:8].upper()
+        # Gebruik adres per inzending — anders fallback naar projectniveau ADRES_MAP
+        _straat  = submission.get('adres_straat', '')
+        _huisnr  = submission.get('adres_huisnummer', '')
+        if _straat and _huisnr:
+            adres = f'{_straat} {_huisnr}'
+        elif _straat:
+            adres = _straat
+        else:
+            adres = ADRES_MAP.get(project_id, '—')
+
+        # ── Foto's inladen voor inline embedding ──────────────────────────
+        foto_data_list  = []   # (cid, bytes, ext)
+        foto_html_items = ''
+        foto_bijschriften_sub = submission.get('foto_bijschriften', [])
+        for i, fpath in enumerate(fotos):
+            cid = f'foto_{i+1}'
+            ext = os.path.splitext(fpath)[1].lower() or '.jpg'
+            # Bijschrift ophalen
+            binfo    = foto_bijschriften_sub[i] if i < len(foto_bijschriften_sub) else {}
+            bijschr  = binfo.get('bijschrift', '')
+            mw_uren  = binfo.get('mw_uren', '')
+            mw_mat   = binfo.get('mw_materiaal', '')
+            # Badge HTML
+            if bijschr == 'Meerwerk':
+                badge_parts = ['Meerwerk']
+                if mw_uren:  badge_parts.append(f'{mw_uren} u')
+                if mw_mat:   badge_parts.append(mw_mat)
+                badge_html = (
+                    f'<div style="background:#E07820;color:#fff;font-size:10px;font-weight:800;'
+                    f'letter-spacing:0.06em;text-transform:uppercase;padding:3px 8px;'
+                    f'border-radius:0 0 5px 5px;text-align:center">'
+                    f'{" · ".join(badge_parts)}</div>'
+                )
+            elif bijschr:
+                badge_html = (
+                    f'<div style="background:#1a1a1a;color:#888;font-size:10px;font-weight:700;'
+                    f'letter-spacing:0.08em;text-transform:uppercase;padding:3px 8px;'
+                    f'border-radius:0 0 5px 5px;text-align:center">{bijschr}</div>'
+                )
+            else:
+                badge_html = ''
+            try:
+                with open(fpath, 'rb') as fh:
+                    foto_data_list.append((cid, fh.read(), ext))
+                foto_html_items += (
+                    f'<div style="margin:10px 0;border-radius:6px;overflow:hidden;'
+                    f'border:1px solid #2a2a2a">'
+                    f'<img src="cid:{cid}" style="max-width:100%;display:block">'
+                    f'{badge_html}</div>'
+                )
+            except Exception:
+                foto_html_items += (
+                    f'<div style="color:#666;font-size:12px;padding:4px 0">'
+                    f'[foto {i+1} niet gevonden]</div>'
+                )
+        if not foto_html_items:
+            foto_html_items = "<div style=\"color:#444;font-size:12px;letter-spacing:0.06em\">Geen foto's bijgevoegd</div>"
+
+        # ── Meerwerk sectie ───────────────────────────────────────────────
+        mw_actief = meerwerk.get('actief', False)
+        meerwerk_html       = ''
+        kopie_meerwerk_regel = ''
+        if mw_actief:
+            mw_type   = meerwerk.get('type', '—')
+            mw_uren   = meerwerk.get('uren', '0')
+            mw_mat    = meerwerk.get('materiaal_omschrijving') or f"€ {meerwerk.get('materiaal', '0')}"
+            mw_bedrag = meerwerk.get('bedrag', '0')
+            bedrag_str = f'€ {mw_bedrag}' if str(mw_bedrag) not in ('0', '') else '—'
+            meerwerk_html = f"""
+            <tr><td colspan="2" style="padding:12px 16px;background:#241500;border-top:2px solid #E07820;
+                font-weight:900;color:#E07820;font-size:10px;letter-spacing:2.5px;text-transform:uppercase">MEERWERK</td></tr>
+            <tr><td style="padding:9px 16px;color:#888;font-size:13px;width:130px">Type</td>
+                <td style="padding:9px 16px;color:#fff;font-size:13px">{mw_type}</td></tr>
+            <tr style="background:#1a1a1a">
+                <td style="padding:9px 16px;color:#888;font-size:13px">Uren meerwerk</td>
+                <td style="padding:9px 16px;color:#fff;font-size:13px">{mw_uren} uur</td></tr>
+            <tr><td style="padding:9px 16px;color:#888;font-size:13px">Materiaal</td>
+                <td style="padding:9px 16px;color:#fff;font-size:13px">{mw_mat}</td></tr>
+            <tr style="background:#1a1a1a">
+                <td style="padding:9px 16px;color:#888;font-size:13px">Bedrag</td>
+                <td style="padding:9px 16px;color:#E07820;font-size:16px;font-weight:700">{bedrag_str}</td></tr>
+            """
+            kopie_meerwerk_regel = (
+                f'\nMEERWERK TYPE : {mw_type}'
+                f'\nUREN MEERWERK : {mw_uren} uur'
+                f'\nMATERIAAL     : {mw_mat}'
+                f'\nBEDRAG        : {bedrag_str}'
+            )
+
+        # ── Kopie-klaar blok (plain text, één klik kopiëren naar bon) ─────
+        kopie_blok = (
+            f'DATUM         : {datum}\n'
+            f'PROJECT       : {project}\n'
+            f'ADRES         : {adres}\n'
+            f'MEDEWERKER    : {medewerker}\n'
+            f'OMSCHRIJVING  : {omschrijving}'
+            f'{kopie_meerwerk_regel}\n'
+            f"FOTO'S        : {len(fotos)} bijgevoegd\n"
+            f'REF           : {ref}'
+        )
+
+        # ── Machine-leesbaar JSON-blok — onderaan email als zichtbare plaintext ──
+        # QB-DOCS pakt dit op via ===QB_INZENDING=== delimiter in email body.
+        # Alle dakraam-velden gevuld (adres + klein/middel/groot/kit/sloop/boei).
+        project_code = PROJECT_CODES.get(project_id, 'UNKNOWN')
+        medewerker_short = (
+            medewerker.split('—')[0].strip().split()[0].lower()
+            if medewerker and medewerker != '—' else ''
+        )
+        inzending_payload = {
+            "ref":           ref,
+            "datum":         datum,
+            "project":       project_code,
+            "project_id":    project_id,
+            "adres":         adres,
+            "medewerker":    medewerker_short,
+            "omschrijving":  omschrijving,
+            "fotos":         len(fotos),
+            "werkzaamheden": "mw" if mw_actief else "aw",
+            "meerwerk_uren": (float(meerwerk.get('uren', 0) or 0) if mw_actief else None),
+            "meerwerk_materiaal": (meerwerk.get('materiaal_omschrijving') if mw_actief else None),
+            # Dakraam velden — gevuld vanuit app-formulier (alleen AW JP Daken):
+            "klein":  (submission.get('aw_klein')  if not mw_actief else None),
+            "middel": (submission.get('aw_middel') if not mw_actief else None),
+            "groot":  (submission.get('aw_groot')  if not mw_actief else None),
+            "kit":    (submission.get('aw_kit')    if not mw_actief else None),
+            "sloop":  (submission.get('aw_sloop')  if not mw_actief else None),
+            "boei":   (submission.get('aw_boei')   if not mw_actief else None),
+            "foto_bijschriften": submission.get('foto_bijschriften', []),
+            "foto_download_url": f"https://app.qualitybuilds.nl/api/fotos/{ref}",
+        }
+        inzending_json_line = json.dumps(inzending_payload, ensure_ascii=False, separators=(',', ':'))
+
+        type_label = 'MEERWERK + INZENDING' if mw_actief else 'FOTO INZENDING'
+
+        html = f"""
+        <html><body style="margin:0;padding:0;background:#0f0f0f;font-family:'Segoe UI',system-ui,sans-serif">
+        <div style="max-width:620px;margin:0 auto;padding:24px 16px">
+
+          <!-- QUALITY BUILDS INZENDING — zichtbaar zodat QB-DOCS kan parsen via get_page_text -->
+
+          <!-- Logo header -->
+          <div style="background:#1a1a1a;padding:18px 24px 14px;border-radius:12px 12px 0 0;text-align:center;border-bottom:1px solid #2a2a2a">
+            <img src="https://app.qualitybuilds.nl/logo.png" alt="Quality Builds"
+                 style="height:44px;width:auto;max-width:200px;display:inline-block">
+          </div>
+
+          <!-- Type header -->
+          <div style="background:#E07820;padding:14px 24px">
+            <div style="font-size:10px;font-weight:900;color:#fff;letter-spacing:2.5px;text-transform:uppercase">{type_label}</div>
+            <div style="font-size:12px;color:rgba(255,255,255,0.8);margin-top:4px;letter-spacing:0.05em">
+              {datum} &nbsp;&middot;&nbsp; {medewerker.split('—')[0].strip()} &nbsp;&middot;&nbsp; REF: {ref}
+            </div>
+          </div>
+
+          <!-- Info tabel -->
+          <table style="width:100%;border-collapse:collapse;background:#141414">
+            <tr><td style="padding:10px 16px;color:#666;font-size:11px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;width:130px">Medewerker</td>
+                <td style="padding:10px 16px;color:#f0f0f0;font-size:14px;font-weight:600">{medewerker}</td></tr>
+            <tr style="background:#1a1a1a">
+                <td style="padding:10px 16px;color:#666;font-size:11px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase">Project</td>
+                <td style="padding:10px 16px;color:#f0f0f0;font-size:13px">{project}</td></tr>
+            <tr><td style="padding:10px 16px;color:#666;font-size:11px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase">Adres</td>
+                <td style="padding:10px 16px;color:#f0f0f0;font-size:13px">{adres}</td></tr>
+            <tr style="background:#1a1a1a">
+                <td style="padding:10px 16px;color:#666;font-size:11px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase">Datum</td>
+                <td style="padding:10px 16px;color:#f0f0f0;font-size:13px">{datum}</td></tr>
+            <tr><td style="padding:10px 16px;color:#666;font-size:11px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;vertical-align:top">Omschrijving</td>
+                <td style="padding:10px 16px;color:#f0f0f0;font-size:14px;line-height:1.5">{omschrijving}</td></tr>
+            {meerwerk_html}
+          </table>
+
+          <!-- Kopie-klaar blok -->
+          <div style="background:#111;border:1px solid #2a2a2a;border-top:2px solid #333;padding:16px;margin-top:0">
+            <div style="font-size:9px;font-weight:900;color:#555;letter-spacing:2.5px;text-transform:uppercase;margin-bottom:12px">KOPIE-KLAAR VOOR BON</div>
+            <pre style="margin:0;font-family:'Courier New',Consolas,monospace;font-size:12px;color:#999;
+                        white-space:pre-wrap;line-height:1.9;border-left:2px solid #2a2a2a;padding-left:12px">{kopie_blok}</pre>
+          </div>
+
+          <!-- Foto's ingesloten -->
+          <div style="background:#141414;border:1px solid #1a1a1a;border-top:none;border-radius:0 0 8px 8px;padding:16px;margin-top:0">
+            <div style="font-size:9px;font-weight:900;color:#555;letter-spacing:2.5px;text-transform:uppercase;margin-bottom:14px">FOTO'S &nbsp;({len(fotos)})</div>
+            {foto_html_items}
+          </div>
+
+          <!-- QB-DOCS machine-leesbaar blok — plaintext JSON voor auto-parsing WR/UB -->
+          <div style="background:#080808;border-top:1px solid #181818;padding:10px 16px;margin-top:4px">
+            <div style="font-size:9px;color:#282828;letter-spacing:2px;text-transform:uppercase;margin-bottom:4px">QB-DOCS INZENDING DATA</div>
+            <pre style="margin:0;font-size:11px;color:#2a2a2a;font-family:monospace;white-space:pre-wrap;word-break:break-all;line-height:1.6">===QB_INZENDING===
+{inzending_json_line}
+===EINDE===</pre>
+          </div>
+
+          <div style="margin-top:20px;text-align:center;font-size:10px;color:#333;letter-spacing:0.1em;text-transform:uppercase">
+            Quality Builds BV &nbsp;&middot;&nbsp; {ref}
+          </div>
+        </div></body></html>
+        """
+
+        # ── Bericht opbouwen met inline afbeeldingen ──────────────────────
+        msg_outer = MIMEMultipart('mixed')
+        msg_outer['Subject'] = (
+            f"{'Meerwerk' if mw_actief else 'Inzending'}: "
+            f"{medewerker.split('—')[0].strip()} — {project} — {datum} · REF: {ref}"
+        )
+        msg_outer['From'] = smtp_user
+        msg_outer['To']   = to_email
+
+        msg_related = MIMEMultipart('related')
+        msg_related.attach(MIMEText(html, 'html'))
+
+        for cid, data, ext in foto_data_list:
+            subtype = 'jpeg' if ext in ('.jpg', '.jpeg') else ext.lstrip('.')
+            img = MIMEImage(data, _subtype=subtype)
+            img.add_header('Content-ID', f'<{cid}>')
+            img.add_header('Content-Disposition', 'inline', filename=f'{cid}{ext}')
+            msg_related.attach(img)
+
+        msg_outer.attach(msg_related)
+
+        with smtplib.SMTP(smtp_host, smtp_port, timeout=15) as server:
+            server.starttls()
+            server.login(smtp_user, smtp_pass)
+            server.sendmail(smtp_user, to_email, msg_outer.as_string())
+
+        print(f"[QB] ✅ E-mail verstuurd naar {to_email} ({len(fotos)} foto's ingesloten)")
+    except Exception as e:
+        print(f'[QB] ⚠️  E-mail fout: {e}')
+
+# ── Routes ─────────────────────────────────────────────────────────────────
+
+@app.route('/')
+def index():
+    """Serveert de mobiele web-app."""
+    app_path = os.path.join(BASE_DIR, 'app.html')
+    return send_file(app_path)
+
+@app.route('/api/upload', methods=['POST'])
+def upload():
+    """Verwerkt foto's + meerwerk inzending."""
+    try:
+        # ── Form data ophalen ──────────────────────────────────────────────
+        medewerker   = request.form.get('medewerker', 'Onbekend')
+        project_id   = request.form.get('project_id', '0000')
+        datum        = request.form.get('datum', datetime.date.today().isoformat())
+        omschrijving = request.form.get('omschrijving', '')
+        mw_actief             = request.form.get('meerwerk_actief', 'false') == 'true'
+        mw_type               = request.form.get('mw_type', '')
+        mw_totaal_uren        = request.form.get('mw_totaal_uren', '0')   # form-level uren (nieuw)
+        mw_mat_omschr_form    = request.form.get('mw_materiaal', '')       # form-level materiaal (nieuw)
+        mw_bedrag             = request.form.get('mw_bedrag', '0')
+        mw_materiaal_omschr   = request.form.get('mw_materiaal_omschrijving', '')
+        adres_straat          = request.form.get('adres_straat', '')
+        adres_huisnummer      = request.form.get('adres_huisnummer', '')
+        try:
+            aw_klein  = int(request.form.get('klein',  '0') or '0')
+            aw_middel = int(request.form.get('middel', '0') or '0')
+            aw_groot  = int(request.form.get('groot',  '0') or '0')
+            aw_kit    = int(request.form.get('kit',    '0') or '0')
+            aw_sloop  = float(request.form.get('sloop','0') or '0')
+            aw_boei   = float(request.form.get('boei', '0') or '0')
+        except (ValueError, TypeError):
+            aw_klein = aw_middel = aw_groot = aw_kit = 0
+            aw_sloop = aw_boei = 0.0
+
+        foto_dir       = get_foto_dir(project_id)
+        opgeslagen     = []
+        ts_prefix      = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+
+        # ── Bijschriften uitlezen ─────────────────────────────────────────
+        foto_bijschriften = []
+        files_raw = request.files.getlist('fotos')
+        for i in range(len(files_raw)):
+            bijschr = request.form.get(f'foto_bijschrift_{i}', '')
+            mw_uren = request.form.get(f'foto_mw_uren_{i}', '')
+            mw_mat  = request.form.get(f'foto_mw_mat_{i}', '')
+            foto_bijschriften.append({'bijschrift': bijschr, 'mw_uren': mw_uren, 'mw_materiaal': mw_mat})
+
+        # ── Foto's opslaan ────────────────────────────────────────────────
+        files = request.files.getlist('fotos')
+        for i, file in enumerate(files):
+            if file and file.filename:
+                ext  = os.path.splitext(secure_filename(file.filename))[1].lower() or '.jpg'
+                naam = f'VELD_{ts_prefix}_{medewerker.split()[0].upper()}_{i+1:02d}{ext}'
+                pad  = os.path.join(foto_dir, naam)
+                file.save(pad)
+                opgeslagen.append(pad)
+                print(f'[QB] Opgeslagen: {pad}')
+
+        # ── Submission ID ─────────────────────────────────────────────────
+        sub_id = str(uuid.uuid4()).replace('-', '')[:16]
+
+        submission = {
+            'id':               sub_id,
+            'type':             'veld_submission',
+            'timestamp':        datetime.datetime.now().isoformat(),
+            'medewerker':       medewerker,
+            'project_id':       project_id,
+            'project_naam':     PROJECT_NAMES.get(project_id, project_id),
+            'datum':            datum,
+            'omschrijving':     omschrijving,
+            'fotos_opgeslagen': opgeslagen,
+            'fotos_count':      len(opgeslagen),
+            'meerwerk': {
+                'actief':                mw_actief,
+                'type':                  mw_type,
+                'uren':                  mw_totaal_uren,
+                'materiaal_omschrijving': mw_mat_omschr_form or mw_materiaal_omschr,
+                'bedrag':                mw_bedrag,
+            } if mw_actief else {'actief': False},
+            'verified':         False,
+            'urgent':           mw_actief,
+            'adres_straat':     adres_straat,
+            'adres_huisnummer': adres_huisnummer,
+            'aw_klein':         aw_klein,
+            'aw_middel':        aw_middel,
+            'aw_groot':         aw_groot,
+            'aw_kit':           aw_kit,
+            'aw_sloop':         aw_sloop,
+            'aw_boei':          aw_boei,
+            'foto_bijschriften': foto_bijschriften,
+        }
+
+        # ── PENDING_REVIEWS.json updaten ──────────────────────────────────
+        pending = load_pending()
+        pending.insert(0, submission)
+        save_pending(pending)
+        print(f'[QB] 📋 Toegevoegd aan PENDING_REVIEWS: {sub_id}')
+
+        # ── E-mail sturen (asynchroon — blokkeert app niet bij SMTP timeout) ──
+        threading.Thread(target=stuur_email, args=(submission,), daemon=True).start()
+
+        return jsonify({
+            'success':    True,
+            'id':         sub_id,
+            'fotos':      len(opgeslagen),
+            'meerwerk':   mw_actief,
+            'project':    PROJECT_NAMES.get(project_id, project_id),
+        })
+
+    except Exception as e:
+        print(f'[QB] ❌ Upload fout: {e}')
+        import traceback; traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/uren', methods=['POST'])
+def uren():
+    """Verwerkt urenregistratie (uurwerk of aanneemwerk)."""
+    try:
+        medewerker   = request.form.get('medewerker', 'Onbekend')
+        project_id   = request.form.get('project_id', '0000')
+        datum        = request.form.get('datum', datetime.date.today().isoformat())
+        begintijd    = request.form.get('begintijd', '')
+        eindtijd     = request.form.get('eindtijd', '')
+        totaal_uren  = float(request.form.get('totaal_uren', 0))
+        werktype     = request.form.get('werktype', 'uurwerk')
+        tarief       = float(request.form.get('tarief', 50))
+        omschrijving = request.form.get('omschrijving', '')
+
+        # Aanneemwerk velden (optioneel)
+        aw_id           = request.form.get('aanneemwerk_id', '')
+        aw_omschrijving = request.form.get('aanneemwerk_omschrijving', '')
+        aw_bedrag       = float(request.form.get('aanneemwerk_bedrag', 0))
+
+        # Bedrag berekenen
+        if werktype == 'aanneemwerk':
+            bedrag_berekend = aw_bedrag
+        else:
+            bedrag_berekend = totaal_uren * tarief
+
+        sub_id = str(uuid.uuid4()).replace('-', '')[:16]
+
+        submission = {
+            'id':               sub_id,
+            'type':             'uren_registratie',
+            'timestamp':        datetime.datetime.now().isoformat(),
+            'medewerker':       medewerker,
+            'project_id':       project_id,
+            'project_naam':     PROJECT_NAMES.get(project_id, project_id),
+            'datum':            datum,
+            'begintijd':        begintijd,
+            'eindtijd':         eindtijd,
+            'totaal_uren':      totaal_uren,
+            'werktype':         werktype,
+            'tarief':           tarief,
+            'bedrag_berekend':  bedrag_berekend,
+            'omschrijving':     omschrijving,
+            'verified':         False,
+        }
+
+        # Aanneemwerk info toevoegen als van toepassing
+        if werktype == 'aanneemwerk' and aw_id:
+            submission['aanneemwerk_id']           = aw_id
+            submission['aanneemwerk_omschrijving'] = aw_omschrijving
+            submission['aanneemwerk_bedrag']       = aw_bedrag
+
+        # Opslaan in PENDING_REVIEWS.json
+        pending = load_pending()
+        pending.insert(0, submission)
+        save_pending(pending)
+        print(f'[QB] ⏱️  Uren geregistreerd: {medewerker} · {totaal_uren}u · €{bedrag_berekend:.2f}')
+
+        # E-mail sturen (asynchroon — blokkeert app niet bij SMTP timeout)
+        threading.Thread(target=stuur_email_uren, args=(submission,), daemon=True).start()
+
+        return jsonify({
+            'success':     True,
+            'id':          sub_id,
+            'totaal_uren': totaal_uren,
+            'werktype':    werktype,
+            'bedrag':      bedrag_berekend,
+            'project':     PROJECT_NAMES.get(project_id, project_id),
+        })
+
+    except Exception as e:
+        print(f'[QB] ❌ Uren fout: {e}')
+        import traceback; traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/team-stats')
+def team_stats():
+    """Geeft werkelijke + verwachte uren per medewerker (7d / 30d).
+    Meerwerk-uren worden apart getoond en NIET meegenomen in verschil-berekening.
+    """
+    try:
+        pending = load_pending()
+        today   = datetime.date.today()
+        d7      = (today - datetime.timedelta(days=7)).isoformat()
+        d30     = (today - datetime.timedelta(days=30)).isoformat()
+
+        # ── 1. Werkelijke uren uit uren_registratie entries ──────────────────
+        uren_logs = [e for e in pending if e.get('type') == 'uren_registratie']
+        stats = {}
+        for entry in uren_logs:
+            naam      = entry.get('medewerker', 'Onbekend')
+            datum     = entry.get('datum', '')
+            uren      = float(entry.get('totaal_uren', 0))
+            is_mw     = bool(entry.get('is_meerwerk', False))
+
+            if naam not in stats:
+                stats[naam] = {
+                    'uren_7d_werkelijk':    0.0,
+                    'uren_30d_werkelijk':   0.0,
+                    'meerwerk_uren_7d':     0.0,
+                    'meerwerk_uren_30d':    0.0,
+                    'laatste_datum':        '',
+                    'inzendingen':          0,
+                }
+            s = stats[naam]
+            if datum >= d7:
+                s['uren_7d_werkelijk'] += uren
+                if is_mw:
+                    s['meerwerk_uren_7d'] += uren
+            if datum >= d30:
+                s['uren_30d_werkelijk'] += uren
+                if is_mw:
+                    s['meerwerk_uren_30d'] += uren
+            if datum > s['laatste_datum']:
+                s['laatste_datum'] = datum
+            s['inzendingen'] += 1
+
+        # ── 1b. Werkelijke uren Bryan + Maurice uit WR PDFs ─────────────────
+        # Normtijden uit QB_NORMTIJDEN.json (single source of truth).
+        # dakraam_klein_min = minuten per persoon per raam (35)
+        # boeideel_min_per_m = minuten TOTAAL per meter (60) → per persoon = /2 = 30
+        # Bryan én Maurice werken altijd samen → elk dezelfde uren.
+        _nt = _load_normtijden()
+        MIN_RAAM_PP  = _nt.get('dakraam_klein_min', 35)        # min/pp/raam
+        MIN_BOEI_PP  = _nt.get('boeideel_min_per_m', 60) / 2   # min/pp/m (totaal÷2 personen)
+
+        def _wk_maandag(fn):
+            m = re.search(r'WK[_\-]?(\d{1,2})[_\-](\d{4})', fn, re.IGNORECASE)
+            if not m:
+                return None
+            try:
+                return datetime.date.fromisocalendar(int(m.group(2)), int(m.group(1)), 1).isoformat()
+            except Exception:
+                return None
+
+        wr_veld = wr_dakramen_totals()
+        if wr_veld.get('beschikbaar') and wr_veld.get('per_week'):
+            for wk in wr_veld['per_week']:
+                md = _wk_maandag(wk.get('bestand', ''))
+                if md is None:
+                    continue
+                totaal_ramen = (wk.get('klein', 0) + wk.get('middel', 0) + wk.get('groot', 0))
+                boei_m = float(wk.get('boei', 0.0))
+                if totaal_ramen == 0 and boei_m == 0:
+                    continue
+                uren_pp = round((totaal_ramen * MIN_RAAM_PP + boei_m * MIN_BOEI_PP) / 60.0, 2)
+
+                uurloon_map = {
+                    'Bryan de Vries — Directeur': 65,
+                    'Maurice Weller — Timmerman': 50,
+                }
+                for naam_veld, uurloon in uurloon_map.items():
+                    if naam_veld not in stats:
+                        stats[naam_veld] = {
+                            'uren_7d_werkelijk': 0.0, 'uren_30d_werkelijk': 0.0,
+                            'meerwerk_uren_7d': 0.0,  'meerwerk_uren_30d': 0.0,
+                            'laatste_datum': '',       'inzendingen': 0,
+                            'uurloon': uurloon,
+                        }
+                    s = stats[naam_veld]
+                    s['uurloon'] = uurloon  # altijd up-to-date houden
+                    if md >= d7:
+                        s['uren_7d_werkelijk']  = round(s['uren_7d_werkelijk']  + uren_pp, 2)
+                    if md >= d30:
+                        s['uren_30d_werkelijk'] = round(s['uren_30d_werkelijk'] + uren_pp, 2)
+                    if md > s.get('laatste_datum', ''):
+                        s['laatste_datum'] = md
+                    s['inzendingen'] += 1
+
+        # ── 1c. Jordi — 1u admin per week ────────────────────────────────────
+        # Jordi werkt 1 uur/week voor financiën/admin. Gestart ~5 maanden geleden.
+        jordi_naam = 'Jordi Boverhoff — Financiën'
+        jordi_start = datetime.date(2025, 12, 1)
+        weken_totaal = max(1, (today - jordi_start).days // 7)
+        if jordi_naam not in stats:
+            stats[jordi_naam] = {
+                'uren_7d_werkelijk': 0.0, 'uren_30d_werkelijk': 0.0,
+                'meerwerk_uren_7d': 0.0,  'meerwerk_uren_30d': 0.0,
+                'laatste_datum': today.isoformat(), 'inzendingen': weken_totaal,
+                'uurloon': 50,
+            }
+        stats[jordi_naam]['uren_7d_werkelijk']  = 1.0
+        stats[jordi_naam]['uren_30d_werkelijk'] = round(30 / 7, 1)   # ~4.3u per maand
+        stats[jordi_naam]['uren_totaal_historisch'] = float(weken_totaal)
+        stats[jordi_naam]['uurloon'] = 50
+
+        # ── 2. Verwachte uren uit WR PDFs via normtijden ─────────────────────
+        wr_data = wr_dakramen_totals()
+        verwacht_7d  = None
+        verwacht_30d = None
+
+        if wr_data.get('beschikbaar') and wr_data.get('per_week'):
+            # Gebruik per_week om WR-weken binnen 7d / 30d te filteren
+            # Bestandsnaam format: WK_XX_2026_PURMEREND_WR.pdf
+            def wk_datum(fn):
+                """Geef maandag van de WR-week als datum-string YYYY-MM-DD."""
+                m = re.search(r'WK[_\-]?(\d{1,2})[_\-](\d{4})', fn, re.IGNORECASE)
+                if not m:
+                    return None
+                wk, yr = int(m.group(1)), int(m.group(2))
+                try:
+                    # ISO week → maandag
+                    d = datetime.date.fromisocalendar(yr, wk, 1)
+                    return d.isoformat()
+                except Exception:
+                    return None
+
+            tot_verwacht_7d  = 0.0
+            tot_verwacht_30d = 0.0
+            cnt_7d = cnt_30d = 0
+
+            for wk in wr_data['per_week']:
+                md = wk_datum(wk.get('bestand', ''))
+                if md is None:
+                    continue
+                vu = verwacht_uren_uit_wr(wk)
+                if vu is None:
+                    continue
+                if md >= d7:
+                    tot_verwacht_7d  += vu
+                    cnt_7d += 1
+                if md >= d30:
+                    tot_verwacht_30d += vu
+                    cnt_30d += 1
+
+            verwacht_7d  = round(tot_verwacht_7d,  2) if cnt_7d  > 0 else 0.0
+            verwacht_30d = round(tot_verwacht_30d, 2) if cnt_30d > 0 else 0.0
+
+        # ── 3. Voeg verwacht + verschil toe aan elk team-lid ─────────────────
+        # Verdeel verwachte uren evenredig over medewerkers die in die periode actief zijn.
+        # Als er maar 1 medewerker is → alles naar die. Bij 2 → 50/50 split.
+        actief_7d  = [n for n, s in stats.items() if s['uren_7d_werkelijk'] > 0]
+        actief_30d = [n for n, s in stats.items() if s['uren_30d_werkelijk'] > 0]
+        n7  = max(len(actief_7d),  1)
+        n30 = max(len(actief_30d), 1)
+
+        for naam, s in stats.items():
+            # Verwacht
+            vw7  = round(verwacht_7d  / n7,  2) if verwacht_7d  is not None and naam in actief_7d  else 0.0
+            vw30 = round(verwacht_30d / n30, 2) if verwacht_30d is not None and naam in actief_30d else 0.0
+
+            # Werkelijk excl. meerwerk (eerlijk vergelijken met normtijden)
+            werk_ex_mw_7d  = round(s['uren_7d_werkelijk']  - s['meerwerk_uren_7d'],  2)
+            werk_ex_mw_30d = round(s['uren_30d_werkelijk'] - s['meerwerk_uren_30d'], 2)
+
+            # Verschil: positief = meer gewerkt dan verwacht (efficiënt of extra)
+            vsch7  = round(werk_ex_mw_7d  - vw7,  2) if vw7  > 0 else None
+            vsch30 = round(werk_ex_mw_30d - vw30, 2) if vw30 > 0 else None
+
+            # Verschil %
+            vsch7_pct  = round(vsch7  / vw7  * 100, 1) if vsch7  is not None and vw7  > 0 else None
+            vsch30_pct = round(vsch30 / vw30 * 100, 1) if vsch30 is not None and vw30 > 0 else None
+
+            s['uren_7d_verwacht']      = vw7
+            s['uren_30d_verwacht']     = vw30
+            s['uren_7d_verschil']      = vsch7
+            s['uren_7d_verschil_pct']  = vsch7_pct
+            s['uren_30d_verschil']     = vsch30
+            s['uren_30d_verschil_pct'] = vsch30_pct
+
+            # Afronden werkelijk voor display
+            s['uren_7d_werkelijk']  = round(s['uren_7d_werkelijk'],  2)
+            s['uren_30d_werkelijk'] = round(s['uren_30d_werkelijk'], 2)
+            s['meerwerk_uren_30d']  = round(s['meerwerk_uren_30d'],  2)
+
+            # Backward compat — oude dashboard-velden
+            s['uren_7d']  = s['uren_7d_werkelijk']
+            s['uren_30d'] = s['uren_30d_werkelijk']
+
+        return jsonify(stats)
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/aanneemwerk')
+def get_aanneemwerk():
+    """Geeft geconfigureerde aanneemwerk jobs terug voor een project (altijd vers uit config.json)."""
+    # Herlaad config live zodat Bryan jobs kan toevoegen zonder server-herstart
+    try:
+        with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
+            live_cfg = json.load(f)
+    except Exception:
+        live_cfg = CFG
+    project_id = request.args.get('project_id', '')
+    jobs = live_cfg.get('aanneemwerk_jobs', [])
+    if project_id:
+        jobs = [j for j in jobs if j.get('project_id') in (project_id, '', None)]
+    return jsonify([j for j in jobs if j.get('actief', True)])
+
+
+@app.route('/logo.png')
+def logo():
+    return send_file(os.path.join(BASE_DIR, 'logo.png'), mimetype='image/png')
+
+@app.route('/manifest.json')
+def manifest():
+    return send_file(os.path.join(BASE_DIR, 'manifest.json'), mimetype='application/manifest+json')
+
+@app.route('/sw.js')
+def sw():
+    return send_file(os.path.join(BASE_DIR, 'sw.js'), mimetype='application/javascript')
+
+@app.route('/icon-192.png')
+def icon192():
+    return send_file(os.path.join(BASE_DIR, 'icon-192.png'), mimetype='image/png')
+
+@app.route('/icon-512.png')
+def icon512():
+    return send_file(os.path.join(BASE_DIR, 'icon-512.png'), mimetype='image/png')
+
+@app.route('/favicon.png')
+def favicon():
+    return send_file(os.path.join(BASE_DIR, 'favicon.png'), mimetype='image/png')
+
+@app.route('/dashboard')
+def dashboard():
+    """Serveert het QB Godmode dashboard (alleen voor Bryan & Jordi)."""
+    dash_path = os.path.join(QB_ROOT, '07_REPORTING_AND_BI', 'QB_GODMODE_DASHBOARD.html')
+    if os.path.exists(dash_path):
+        return send_file(dash_path, mimetype='text/html')
+    return '<html><body style="background:#0a0a0a;color:#fff;font-family:sans-serif;padding:40px"><h2 style="color:#E07820">Dashboard niet gevonden</h2><p>Pad: ' + dash_path + '</p></body></html>', 404
+
+@app.route('/api/alert-action', methods=['POST'])
+def alert_action():
+    """Verwerkt een alert-actie (gedaan/bezig/skip/reopen) en logt naar ORACLE_LOG.json."""
+    try:
+        data    = request.get_json(silent=True) or {}
+        sub_id  = data.get('sub_id', '')
+        action  = data.get('action', '')
+        title   = data.get('title', '')
+        project = data.get('project', '')
+        actor   = data.get('actor', 'Bryan')
+
+        # Update PENDING_REVIEWS.json als sub_id aanwezig
+        if sub_id:
+            pending = load_pending()
+            for item in pending:
+                if item.get('id') == sub_id:
+                    if action in ('done', 'skip'):
+                        item['verified'] = True
+                    elif action == 'reopen':
+                        item['verified'] = False
+                    item['status']      = action
+                    item['actioned_at'] = datetime.datetime.now().isoformat()
+                    item['actioned_by'] = actor
+                    break
+            save_pending(pending)
+            print(f'[QB] Oracle: {action} → {sub_id[:8]} — {title[:40]}')
+
+        # Append naar ORACLE_LOG.json
+        log_path = os.path.join(QB_ROOT, '00_COMPANY_DATA', 'ORACLE_LOG.json')
+        try:
+            with open(log_path, 'r', encoding='utf-8') as f:
+                log = json.load(f)
+        except Exception:
+            log = []
+
+        log.insert(0, {
+            'ts':      datetime.datetime.now().isoformat(),
+            'actie':   action,
+            'titel':   title,
+            'project': project,
+            'actor':   actor,
+            'sub_id':  sub_id or None,
+        })
+
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        with open(log_path, 'w', encoding='utf-8') as f:
+            json.dump(log, f, indent=2, ensure_ascii=False)
+
+        return jsonify({'success': True, 'log_count': len(log)})
+
+    except Exception as e:
+        print(f'[QB] Alert-action fout: {e}')
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/oracle-log')
+def oracle_log():
+    """Geeft het volledige Oracle beslissingslogboek terug."""
+    log_path = os.path.join(QB_ROOT, '00_COMPANY_DATA', 'ORACLE_LOG.json')
+    if os.path.exists(log_path):
+        with open(log_path, 'r', encoding='utf-8') as f:
+            return jsonify(json.load(f))
+    return jsonify([])
+
+
+@app.route('/api/status')
+def status():
+    return jsonify({'status': 'QB Oracle actief', 'tijd': datetime.datetime.now().isoformat()})
+
+@app.route('/health')
+def health():
+    """Systeem health check — gebruikt door QB dagelijkse check (scheduled task)."""
+    import subprocess
+    import ssl
+    import socket as _socket
+
+    result = {
+        'timestamp': datetime.datetime.now().isoformat(),
+        'qb_oracle_service': 'unknown',
+        'nginx_service':     'unknown',
+        'disk_free_gb':      None,
+        'disk_used_pct':     None,
+        'ssl_expires':       None,
+        'ssl_days_left':     None,
+        'ssl_error':         None,
+    }
+
+    # ── Services ───────────────────────────────────────────────────────────
+    for svc, key in [('qb-oracle', 'qb_oracle_service'), ('nginx', 'nginx_service')]:
+        try:
+            r = subprocess.run(
+                ['systemctl', 'is-active', svc],
+                capture_output=True, text=True, timeout=5
+            )
+            result[key] = r.stdout.strip()
+        except Exception as e:
+            result[key] = f'error: {e}'
+
+    # ── Schijfruimte ───────────────────────────────────────────────────────
+    try:
+        total, used, free = shutil.disk_usage('/opt/qb-oracle')
+        result['disk_free_gb']  = round(free  / (1024 ** 3), 1)
+        result['disk_used_pct'] = round(used / total * 100, 1)
+    except Exception as e:
+        result['disk_error'] = str(e)
+
+    # ══ SSL ══════════════════════════════════════════════════════════════════════
+    try:
+        ctx = ssl.create_default_context()
+        with ctx.wrap_socket(_socket.socket(), server_hostname='app.qualitybuilds.nl') as s:
+            s.connect(('app.qualitybuilds.nl', 443))
+            cert = s.getpeercert()
+            exp = datetime.datetime.strptime(cert['notAfter'], '%b %d %H:%M:%S %Y %Z')
+            days_left = (exp - datetime.datetime.utcnow()).days
+            result['ssl_expires']   = exp.strftime('%d-%m-%Y')
+            result['ssl_days_left'] = days_left
+    except Exception as e:
+        result['ssl_error'] = str(e)
+
+    return jsonify(result)
+
+
+# ══ e-Boekhouden live open posten ═════════════════════════════════════════════════════
+@app.route('/api/boekhouden')
+def boekhouden():
+    try:
+        data = eb_fetch()
+        return jsonify({'success': True, **data})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/eb-facturen')
+def eb_facturen_route():
+    """Alle facturen dit jaar + betaalstatus + groepering per relatie."""
+    try:
+        jaar_param = request.args.get('jaar')
+        jaar = int(jaar_param) if jaar_param and jaar_param.isdigit() else None
+        # Invalideer cache als jaar gevraagd wordt
+        if jaar_param and jaar:
+            with _eb_fact_lock:
+                _eb_fact_cache['data'] = None
+                _eb_fact_cache['ts']   = 0
+        data = eb_fetch_facturen(jaar=jaar)
+        return jsonify({'success': True, **data})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/eb-facturen/refresh')
+def eb_facturen_refresh():
+    """Forceer cache-refresh van facturen."""
+    with _eb_fact_lock:
+        _eb_fact_cache['data'] = None
+        _eb_fact_cache['ts']   = 0
+    try:
+        data = eb_fetch_facturen()
+        return jsonify({'success': True, 'message': 'Cache vernieuwd', **data})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/wr-voortgang')
+def wr_voortgang():
+    """WR PDF dakraam-tellingen — live projectvoortgang JP Daken."""
+    try:
+        data = wr_dakramen_totals()
+        return jsonify({'success': True, **data})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/wr-voortgang/refresh')
+def wr_voortgang_refresh():
+    """Forceer herberekening van WR dakraam-tellingen."""
+    with _WR_LOCK:
+        _WR_CACHE['data'] = None
+        _WR_CACHE['ts']   = 0
+    try:
+        data = wr_dakramen_totals()
+        return jsonify({'success': True, 'message': 'WR cache vernieuwd', **data})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/jp-daken-mutaties')
+def jp_daken_mutaties():
+    """GetMutaties JP Daken — alle boekingsregels/factuurregels uit e-boekhouden."""
+    try:
+        data = eb_jp_mutaties()
+        return jsonify({'success': True, **data})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/fotos/<ref>')
+def download_fotos_zip(ref):
+    """Geeft alle fotos van een inzending als ZIP. QB-DOCS gebruikt dit voor auto-sync naar projectmap."""
+    import zipfile, io
+    try:
+        data = load_pending()
+        # load_pending() geeft een list terug (submissions direct op root-niveau)
+        submissions = data if isinstance(data, list) else data.get('submissions', [])
+        # Match op volledige ID of prefix (ref = eerste 8 chars is genoeg)
+        submission = next(
+            (s for s in submissions
+             if s.get('id', '') == ref or s.get('id', '').startswith(ref)),
+            None
+        )
+        if not submission:
+            return jsonify({'error': 'Niet gevonden', 'ref': ref}), 404
+        fotos_paden = submission.get('fotos_opgeslagen', [])
+        if not fotos_paden:
+            return jsonify({'error': 'Geen fotos bij deze inzending'}), 404
+        buf = io.BytesIO()
+        toegevoegd = 0
+        with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for fpath in fotos_paden:
+                if os.path.exists(fpath):
+                    zf.write(fpath, os.path.basename(fpath))
+                    toegevoegd += 1
+        if toegevoegd == 0:
+            return jsonify({'error': 'Fotobestanden niet gevonden op schijf'}), 404
+        buf.seek(0)
+        from flask import send_file as flask_send_file
+        return flask_send_file(
+            buf,
+            mimetype='application/zip',
+            as_attachment=True,
+            download_name=f'fotos_{ref[:8]}.zip'
+        )
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/week/<int:jaar>/<int:wk>')
+def week_data(jaar, wk):
+    """
+    Geeft alle veld-inzendingen voor een ISO-weeknummer terug.
+    Gebruikt door QB-DOCS voor automatische WR/UB generatie.
+
+    GET /api/week/2026/19
+    """
+    import datetime as dt
+
+    try:
+        week_start = dt.date.fromisocalendar(jaar, wk, 1)  # maandag
+        week_end   = dt.date.fromisocalendar(jaar, wk, 7)  # zondag
+    except ValueError as e:
+        return jsonify({'error': f'Ongeldig jaar/week: {e}'}), 400
+
+    pending = load_pending()
+
+    # Filter: veld_submissions binnen deze week
+    submissions_week = []
+    for s in pending:
+        if s.get('type') != 'veld_submission':
+            continue
+        try:
+            datum = dt.date.fromisoformat(s.get('datum', ''))
+        except ValueError:
+            continue
+        if week_start <= datum <= week_end:            submissions_week.append(s)
+
+    # Groepeer per project_id -> per datum -> per adres (sommeer dakramen)
+    projecten = {}
+    for s in submissions_week:
+        pid    = s.get('project_id', '0000')
+        datum  = s.get('datum', '')
+        straat = s.get('adres_straat', '').strip()
+        nr     = s.get('adres_huisnummer', '').strip()
+        adres_key = (straat + ' ' + nr).strip()
+
+        if pid not in projecten:
+            projecten[pid] = {
+                'project_id':   pid,
+                'project_naam': PROJECT_NAMES.get(pid, pid),
+                'adressen': {}
+            }
+
+        key = datum + '_' + adres_key
+        if key not in projecten[pid]['adressen']:
+            projecten[pid]['adressen'][key] = {
+                'datum':         datum,
+                'straat':        straat,
+                'huisnummer':    nr,
+                'adres':         adres_key,
+                'klein':         0,
+                'middel':        0,
+                'groot':         0,
+                'kit':           0,
+                'sloop':         0.0,
+                'boei':          0.0,
+                'medewerkers':   [],
+                'inzending_ids': [],
+            }
+
+        entry = projecten[pid]['adressen'][key]
+        entry['klein']  += int(s.get('aw_klein',  s.get('klein',  0)) or 0)
+        entry['middel'] += int(s.get('aw_middel', s.get('middel', 0)) or 0)
+        entry['groot']  += int(s.get('aw_groot',  s.get('groot',  0)) or 0)
+        entry['kit']    += int(s.get('aw_kit',    s.get('kit',    0)) or 0)
+        entry['sloop']  += float(s.get('aw_sloop', s.get('sloop', 0)) or 0)
+        entry['boei']   += float(s.get('aw_boei',  s.get('boei',  0)) or 0)
+        entry['inzending_ids'].append(s.get('id', ''))
+        med = s.get('medewerker', '')
+        if med and med not in entry['medewerkers']:
+            entry['medewerkers'].append(med)
+
+    # Meerwerk apart
+    meerwerk = []
+    for s in submissions_week:
+        mw = s.get('meerwerk', {})
+        if mw.get('actief'):
+            meerwerk.append({
+                'id':           s.get('id', ''),
+                'datum':        s.get('datum', ''),
+                'medewerker':   s.get('medewerker', ''),
+                'project_id':   s.get('project_id', '0000'),
+                'adres':        (s.get('adres_straat', '') + ' ' + s.get('adres_huisnummer', '')).strip(),
+                'omschrijving': s.get('omschrijving', ''),
+                'uren':         mw.get('uren', 0),
+                'materiaal_omschrijving': mw.get('materiaal_omschrijving', ''),
+            })
+
+    # Projecten dict -> gesorteerde lijsten
+    projecten_out = {}
+    for pid, pdata in projecten.items():
+        adressen_sorted = sorted(pdata['adressen'].values(), key=lambda x: (x['datum'], x['adres']))
+        projecten_out[pid] = {
+            'project_id':   pid,
+            'project_naam': pdata['project_naam'],
+            'adressen':     adressen_sorted,
+            'totaal': {
+                'klein':  sum(a['klein']  for a in adressen_sorted),
+                'middel': sum(a['middel'] for a in adressen_sorted),
+                'groot':  sum(a['groot']  for a in adressen_sorted),
+                'kit':    sum(a['kit']    for a in adressen_sorted),
+                'sloop':  round(sum(a['sloop'] for a in adressen_sorted), 2),
+                'boei':   round(sum(a['boei']  for a in adressen_sorted), 2),
+            }
+        }
+
+    return jsonify({
+        'jaar':               jaar,
+        'week':               wk,
+        'week_start':         week_start.isoformat(),
+        'week_end':           week_end.isoformat(),
+        'projecten':          projecten_out,
+        'meerwerk':           meerwerk,
+        'totaal_inzendingen': len(submissions_week),
+    })
+
+
+# == Start ==================================================================
+@app.route('/api/alerts')
+def alerts():
+    """Open inzendingen voor dashboard alert-widget."""
+    try:
+        submissions = load_pending()
+        open_items = [s for s in submissions if s.get('status', 'open') == 'open']
+        return jsonify({
+            'open':  len(open_items),
+            'items': open_items[:50]
+        })
+    except Exception as e:
+        return jsonify({'error': str(e), 'open': 0, 'items': []}), 500
+
+if __name__ == '__main__':
+    import socket
+    hostname = socket.gethostname()
+    try:
+        local_ip = socket.gethostbyname(hostname)
+    except Exception:
+        local_ip = '127.0.0.1'
+
+    print('\n' + '='*55)
+    print('  QB ORACLE - Quality Builds BV')
+    print('='*55)
+    print('  App:    https://app.qualitybuilds.nl')
+    print('='*55 + '\n')
+    app.run(host='0.0.0.0', port=5050, debug=False)
